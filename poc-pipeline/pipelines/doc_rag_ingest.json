@@ -1,0 +1,95 @@
+{
+  "pipeline": "doc_rag_ingest",
+  "version": "1.0.0",
+  "description": "Document ingestion -> chunk -> embed -> index, with validation gate and dead-letter handling.",
+  "connections": {
+    "source_s3":   { "type": "s3",       "bucket": "${env.DOCS_BUCKET}",  "secret_ref": "secrets/aws_docs_reader" },
+    "vector_db":   { "type": "pgvector", "dsn": "${env.VECTOR_DSN}",      "secret_ref": "secrets/vector_rw" },
+    "embed_api":   { "type": "http",     "base_url": "${env.EMBED_URL}",  "secret_ref": "secrets/embed_api_key" }
+  },
+  "defaults": {
+    "retry": { "max_attempts": 3, "backoff": "exponential", "initial_delay_s": 2 },
+    "timeout_s": 120,
+    "on_error": "fail"
+  },
+  "nodes": [
+    {
+      "id": "list_documents",
+      "task": "connector.s3.list",
+      "connection": "source_s3",
+      "params": { "prefix": "inbound/", "suffixes": [".pdf", ".docx", ".txt"] },
+      "outputs": ["documents"]
+    },
+    {
+      "id": "extract_text",
+      "task": "transform.document.extract_text",
+      "depends_on": ["list_documents"],
+      "for_each": "${list_documents.documents}",
+      "params": { "ocr_fallback": true },
+      "retry": { "max_attempts": 2, "backoff": "exponential", "initial_delay_s": 5 },
+      "on_error": "route",
+      "error_route": "dead_letter",
+      "outputs": ["text", "doc_id", "page_count"]
+    },
+    {
+      "id": "validate_extraction",
+      "task": "control.assert",
+      "depends_on": ["extract_text"],
+      "params": {
+        "assertions": [
+          { "expr": "len(${extract_text.text}) > 200", "message": "extracted text too short - likely a scan failure" },
+          { "expr": "${extract_text.page_count} > 0",  "message": "no pages extracted" }
+        ]
+      },
+      "on_error": "route",
+      "error_route": "dead_letter"
+    },
+    {
+      "id": "chunk",
+      "task": "transform.text.chunk",
+      "depends_on": ["validate_extraction"],
+      "params": { "strategy": "recursive", "chunk_size": 900, "overlap": 120, "preserve_headings": true },
+      "outputs": ["chunks"]
+    },
+    {
+      "id": "embed",
+      "task": "ai.embed",
+      "depends_on": ["chunk"],
+      "connection": "embed_api",
+      "params": { "model": "text-embedding-3-large", "batch_size": 64 },
+      "retry": { "max_attempts": 5, "backoff": "exponential", "initial_delay_s": 3, "retry_on": ["429", "5xx"] },
+      "timeout_s": 300,
+      "outputs": ["vectors"]
+    },
+    {
+      "id": "upsert_index",
+      "task": "connector.pgvector.upsert",
+      "depends_on": ["embed"],
+      "connection": "vector_db",
+      "params": { "table": "doc_chunks", "conflict_key": "chunk_id", "batch_size": 500 },
+      "outputs": ["rows_written"]
+    },
+    {
+      "id": "dead_letter",
+      "task": "connector.s3.put",
+      "connection": "source_s3",
+      "trigger": "on_route",
+      "params": { "prefix": "dead_letter/", "include_error_context": true }
+    },
+    {
+      "id": "emit_metrics",
+      "task": "observability.emit",
+      "depends_on": ["upsert_index"],
+      "trigger": "always",
+      "params": {
+        "metrics": [
+          { "name": "docs_processed",   "value": "${count(list_documents.documents)}" },
+          { "name": "chunks_indexed",   "value": "${upsert_index.rows_written}" },
+          { "name": "dead_lettered",    "value": "${count(dead_letter.items)}" },
+          { "name": "run_duration_ms",  "value": "${run.duration_ms}" }
+        ],
+        "alert_if": "${count(dead_letter.items)} > 0"
+      }
+    }
+  ]
+}
